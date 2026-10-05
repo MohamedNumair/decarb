@@ -1,0 +1,1031 @@
+using Test
+using DECARB
+using CSV, DataFrames, Dates
+using JuMP, HiGHS
+
+const CASE_SRC = joinpath(@__DIR__, "..", "examples", "minimal")
+const MIP_GAP  = 1e-2
+const TLIMIT   = 120.0
+
+"""
+    stage(; patches) -> path
+
+Copy examples/minimal into a temp dir, apply textual patches to files under
+`in/`, run the model, return the case path. `patches` maps a filename to either
+one `old => new` pair or a collection of pairs.
+"""
+function stage(; patches = Dict{String,Any}(), run = true)
+    dst = mktempdir()
+    cp(CASE_SRC, dst; force = true)
+    for (fname, file_patches) in patches
+        p = joinpath(dst, "in", fname)
+        s = read(p, String)
+        replacements = file_patches isa Pair ? (file_patches,) : file_patches
+        for (old, new) in replacements
+            @assert occursin(old, s) "patch target not found in $fname: $old"
+            s = replace(s, old => new)
+        end
+        write(p, s)
+    end
+    run && DECARB.run_decarb!(dst; mip_gap=MIP_GAP, time_limit=TLIMIT, verbose=false)
+    return dst
+end
+
+readout(path, f) = CSV.read(joinpath(path, "out", f), DataFrame)
+
+# Load fixtures independently of validation, in the same order as the runner.
+function load_fixture(path)
+    cfg = DECARB.load_cfg(path)
+    sp = DECARB.load_sp(path,cfg)
+    bdg = DECARB.load_bdgii(path,DECARB.load_bdgi(path))
+    tm = DECARB.load_tm(path,cfg,bdg)
+    pv = DECARB.load_pv(path,tm,bdg)
+    chp,abp,hvac,wh,ev = DECARB.load_extended_catalog(path,tm,sp,bdg)
+    wind = DECARB.load_wind(path,tm)
+    bess = DECARB.load_bess(path)
+    topo = DECARB.load_topo(path,chp,abp)
+    return (; cfg, sp, bdg, tm, chp, abp, hvac, wh, pv, wind, bess, ev, topo)
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Representative required numeric fields: common cases, field-specific rules.
+const INPUT_FILE_CASES = [
+    (file="cfg.csv",    field="pIR",      vertical=true,  kind=:float, zero=false, negative=false),
+    (file="bdg_i.csv",  field="pBtck",    vertical=true,  kind=:int,   zero=true,  negative=false),
+    (file="bdg_ii.csv", field="pBtime",   vertical=false, kind=:float, zero=false, negative=false),
+    (file="sp.csv",     field="pHVACz0",  vertical=false, kind=:uint,  zero=true,  negative=false),
+    (file="tm.csv",     field="pTout",    vertical=false, kind=:float, zero=true,  negative=true),
+    (file="chp.csv",    field="fcf",      vertical=false, kind=:float, zero=false, negative=false),
+    (file="abp.csv",    field="fcf",      vertical=false, kind=:float, zero=false, negative=false),
+    (file="hvac.csv",   field="life",     vertical=false, kind=:float, zero=false, negative=false),
+    (file="wh.csv",     field="fcf",      vertical=false, kind=:float, zero=false, negative=false),
+    (file="pv.csv",     field="tech",     vertical=false, kind=:int,   zero=false, negative=false),
+    (file="wind.csv",   field="vmx",      vertical=false, kind=:float, zero=false, negative=false),
+    (file="bess.csv",   field="effu",     vertical=false, kind=:float, zero=false, negative=false),
+    (file="ev.csv",     field="effu",     vertical=false, kind=:float, zero=false, negative=false),
+    (file="topo.csv",   field="eff",      vertical=false, kind=:float, zero=true,  negative=false),
+]
+
+function input_case_result(spec, variant)
+    mktempdir() do path
+        cp(joinpath(CASE_SRC, "in"), path; force=true)
+        try
+            if variant != :valid
+                file = joinpath(path, spec.file)
+                # Read the test fixture into memory; do not map the file we edit.
+                df = CSV.read(read(file), DataFrame; types=String, header=spec.vertical ? false : true)
+                if spec.vertical
+                    row = findfirst(==(spec.field), df[!, 1])
+                    @assert row !== nothing "fixture field not found: $(spec.file):$(spec.field)"
+                    df[row, variant == :missing_field ? 1 : 2] =
+                        variant == :missing_field ? "omitted_$(spec.field)" : variant
+                elseif variant == :missing_field
+                    # Keep column positions intact: test absence of the required name.
+                    rename!(df, spec.field => "omitted_$(spec.field)")
+                else
+                    df[1, spec.field] = variant
+                end
+                CSV.write(file, df; header=!spec.vertical)
+            end
+            logger = Test.TestLogger()
+            err = Test.with_logger(logger) do
+                try
+                    inputs = load_fixture(path)
+                    DECARB.validate_inputs(values(inputs)...; io=devnull)
+                    nothing
+                catch e
+                    e
+                end
+            end
+            return (; error=err, logs=logger.logs)
+        finally
+            # Also release mappings after parser exceptions, before directory cleanup.
+            GC.gc()
+        end
+    end
+end
+
+function test_input_files()
+    # Catch new input files that have not yet been added to this shared coverage.
+    @test Set(spec.file for spec in INPUT_FILE_CASES) ==
+        Set(filter(name -> endswith(name, ".csv"), readdir(joinpath(CASE_SRC, "in"))))
+    for spec in INPUT_FILE_CASES
+        @testset "$(spec.file) :: $(spec.field)" begin
+            for variant in (:valid, :missing_field, "invalid", "", "0", "-1", "NaN", "Inf")
+                @testset "$(repr(variant))" begin
+                    result = input_case_result(spec, variant)
+                    warning_expected = variant == "invalid" ||
+                        (spec.kind != :float && variant in ("NaN", "Inf"))
+                    @test length(result.logs) == Int(warning_expected)
+                    @test all(log -> log.level == Test.Logging.Warn && log._module == CSV &&
+                        occursin(r"error parsing (Float64|Int8|UInt8)", string(log.message)), result.logs)
+                    accepted = variant == :valid || (variant == "0" && spec.zero) ||
+                        (variant == "-1" && spec.negative)
+                    if accepted
+                        @test result.error === nothing
+                    else
+                        @test result.error isa Exception
+                        @test !(result.error isa SystemError || result.error isa Base.IOError)
+                    end
+                end
+            end
+        end
+    end
+end
+
+# Exercise central validation directly, including values that some loaders reject
+# earlier, and verify the documented boundaries across every affected catalog.
+function test_input_bounds()
+    mktempdir() do path
+        cp(joinpath(CASE_SRC, "in"), path; force=true)
+        try
+            baseline = load_fixture(path)
+            invalid_number = (missing, "invalid", NaN, Inf, -Inf)
+            specs = NamedTuple[
+                (catalog=name, field="life",
+                 invalid=(invalid_number..., 0.0, -1.0), valid=(0.1, 1.0),
+                 rule="life must be a positive, finite number " *
+                      "(it is the annuity denominator, even for deselected rows)")
+                for name in (:chp, :abp, :hvac, :wh, :pv, :wind, :bess)
+            ]
+            for name in (:bess, :ev), field in ("effu", "effd")
+                push!(specs, (catalog=name, field=field,
+                    invalid=(invalid_number..., 0.0, -1.0, nextfloat(1.0)),
+                    valid=(eps(Float64), 0.5, 1.0),
+                    rule="$field must be a finite number in (0,1]"))
+            end
+            wind_rule = "vmn and vmx must be finite numbers with 0 <= vmn < vmx"
+            push!(specs, (catalog=:wind, field="vmn",
+                invalid=(invalid_number..., -1.0, baseline.wind["vmx"][1]),
+                valid=(0.0, prevfloat(baseline.wind["vmx"][1])), rule=wind_rule))
+            push!(specs, (catalog=:wind, field="vmx",
+                invalid=(invalid_number..., 0.0, -1.0, baseline.wind["vmn"][1]),
+                valid=(nextfloat(baseline.wind["vmn"][1]), 12.0), rule=wind_rule))
+            push!(specs, (catalog=:topo, field="eff",
+                invalid=(invalid_number..., -eps(Float64), nextfloat(1.0)),
+                valid=(0.0, 0.5, 1.0), rule="eff must be a finite number in [0,1]"))
+
+            for spec in specs
+                @testset "$(spec.catalog).$(spec.field)" begin
+                    for (accepted, cases) in ((false, spec.invalid), (true, spec.valid))
+                        for value in cases
+                            @testset "$(repr(value))" begin
+                                inputs = deepcopy(baseline)
+                                catalog = getproperty(inputs, spec.catalog)
+                                @test catalog["N"] > 0
+                                catalog[spec.field] = Any[catalog[spec.field]...]
+                                catalog[spec.field][1] = value
+                                original = deepcopy(inputs)
+                                if accepted
+                                    @test DECARB.validate_inputs(values(inputs)...; io=devnull) === nothing
+                                else
+                                    row = spec.catalog == :topo ? "topo.csv row 1" :
+                                        "$(spec.catalog).csv row 1 ($(catalog["ty"][1]))"
+                                    @test_throws "$row: $(spec.rule)" DECARB.validate_inputs(values(inputs)...; io=devnull)
+                                end
+                                @test isequal(inputs, original)
+                            end
+                        end
+                    end
+                end
+            end
+        finally
+            GC.gc()
+        end
+    end
+end
+
+# A minimal recording optimizer exercises solver configuration without requiring
+# a proprietary solver or accepting any vendor-specific attributes by accident.
+struct RecordingOptimizer <: MOI.AbstractOptimizer
+    name::String
+    attributes::Dict{MOI.AbstractOptimizerAttribute,Any}
+end
+RecordingOptimizer(name) = RecordingOptimizer(name, Dict{MOI.AbstractOptimizerAttribute,Any}())
+MOI.is_empty(::RecordingOptimizer) = true
+MOI.get(opt::RecordingOptimizer, ::MOI.SolverName) = opt.name
+MOI.supports(::RecordingOptimizer, ::MOI.AbstractOptimizerAttribute) = true
+MOI.set(opt::RecordingOptimizer, attr::MOI.AbstractOptimizerAttribute, value) =
+    (opt.attributes[attr] = value)
+MOI.get(opt::RecordingOptimizer, attr::MOI.AbstractOptimizerAttribute) = opt.attributes[attr]
+
+function temperature_fixture()
+    cfg = Dict("Tin0"=>20.0, "NSTcost"=>0.0)
+    tm = Dict("P"=>3, "TM"=>ones(3), "Tout"=>fill(30.0,3),
+        "Tmn"=>fill(18.0,3), "Tmx"=>fill(22.0,3), "Ton"=>ones(Int,3),
+        "Q_R"=>zeros(3), "Qihg_P"=>zeros(3), "Qihg_L"=>zeros(3), "Qihg_E"=>zeros(3))
+    bdg = Dict{String,Any}("Bk1"=>0.1, "Bk2"=>0.0, "Bk3"=>1.0, "Btime"=>1.0,
+        "Bhvac"=>1, "Bchp"=>1, "Babp"=>1)
+    sp = Dict("HVAC0"=>["HP"], "HVACz0"=>[1], "HVACyn"=>["NO"],
+        "CHP0"=>String[], "CHPz0"=>Int[], "CHPyn"=>String[],
+        "ABP0"=>String[], "ABPz0"=>Int[], "ABPyn"=>String[])
+    hvac = Dict("ty"=>["HP-1","unselected"], "HVmx"=>[0.0,100.0],
+        "ACmx"=>[0.0,100.0], "HVmx_"=>[0.02,0.02], "ACmx_"=>[0.02,0.02])
+    chp = Dict("ty"=>String[], "mx"=>Float64[], "h2p"=>Float64[])
+    abp = Dict("ty"=>String[], "mx"=>Float64[])
+    topo = Dict("chp_bdg"=>zeros(0,2))
+    return (; cfg, tm, bdg, sp, chp, abp, hvac, topo)
+end
+
+
+
+@testset "DECARB.jl" begin
+
+@testset "smoke" begin
+    @test isdefined(DECARB, :run_decarb!)
+    @test pkgversion(DECARB) >= v"1.0.0"
+end
+
+# A small loader fixture retains real demand/weather values without a solve.
+function with_time_fixture(f; start="2019-01-01T05:00:00",
+                           ends=["2019-01-01T06:00:00", "2019-01-01T07:00:00"],
+                           zone="America/New_York", zero_row=false)
+    mktempdir() do path
+        cp(joinpath(CASE_SRC, "in"), path; force=true)
+        cfgfile = joinpath(path, "cfg.csv")
+        write(cfgfile, replace(read(cfgfile, String),
+            r"(?m)^pP0,[^\r\n]+" => "pP0,$start"))
+        tmfile = joinpath(path, "tm.csv")
+        rows = CSV.read(read(tmfile), DataFrame; types=String)[1:length(ends), :]
+        rows.pP = ends
+        if zero_row
+            for column in names(rows)[2:end]
+                rows[1, column] = "0"
+            end
+        end
+        CSV.write(tmfile, rows)
+        try
+            cfg = DECARB.load_cfg(path)
+            bdg = DECARB.load_bdgii(path, DECARB.load_bdgi(path))
+            bdg["Btz"] = zone
+            f(path, cfg, bdg, rows)
+        finally
+            GC.gc() # Release CSV mappings before Windows temp cleanup.
+        end
+    end
+end
+
+@testset "UTC timestamps :: input contract" begin
+    # Clock labels that would be problematic locally are ordinary UTC instants.
+    for (start, finish) in (("2019-03-10T02:00:00", "2019-03-10T03:00:00"),
+                            ("2019-11-03T01:00:00", "2019-11-03T02:00:00"),
+                            ("2019-01-01T05:00", "2019-01-01T06:00"),
+                            ("2019-01-01T05:00:00.125", "2019-01-01T06:00:00.125"))
+        with_time_fixture(; start, ends=[finish]) do path, cfg, bdg, rows
+            tm = DECARB.load_tm(path, cfg, bdg)
+            @test cfg["P0"] == DateTime(start)
+            @test tm["Putc"] == [DateTime(finish)]
+            @test tm["TM"] == [1.0]
+            @test tm["Pmidutc"] == [floor(DateTime(start), Minute) + Minute(30)]
+        end
+    end
+    Test.with_logger(Test.TestLogger()) do
+        for start in ("", "invalid", "2019-02-30T05:00:00")
+            with_time_fixture(; start) do path, cfg, bdg, rows
+                @test_throws "cfg.csv pP0 must be a valid UTC date-time" DECARB.load_tm(path, cfg, bdg)
+            end
+        end
+    end
+    Test.with_logger(Test.TestLogger()) do
+        for value in ("", "invalid", "2019-02-30T05:00:00")
+            with_time_fixture(; ends=[value]) do path, cfg, bdg, rows
+                @test_throws "tm.csv row 1 pP must be a valid UTC date-time" DECARB.load_tm(path, cfg, bdg)
+            end
+        end
+    end
+    with_time_fixture() do path, cfg, bdg, rows
+        write(joinpath(path, "tm.csv"), join(names(rows), ',') * "\n")
+        @test_throws "tm.csv contains no periods" DECARB.load_tm(path, cfg, bdg)
+    end
+end
+
+@testset "UTC timestamps :: elapsed intervals and row preservation" begin
+    with_time_fixture(; zero_row=true,
+        ends=["2019-01-01T05:15:00", "2019-01-01T07:00:00"]) do path, cfg, bdg, rows
+        tm = DECARB.load_tm(path, cfg, bdg)
+        @test tm["P"] == 2
+        @test tm["TM"] == [0.25, 1.75]
+        @test tm["H"] == sum(tm["TM"]) == 2.0
+        @test tm["Pmidutc"] == [DateTime(2019, 1, 1, 5, 7), DateTime(2019, 1, 1, 6, 7)]
+        @test tm["Qlight"] == parse.(Float64, rows.pQlight)
+        @test tm["Sdni"] == parse.(Float64, rows.pSdni)
+        @test tm["Sdhi"] == parse.(Float64, rows.pSdhi)
+        @test tm["Tout"] == parse.(Float64, rows.pTout)
+        @test tm["Qlight"][1] == tm["Sdni"][1] == 0
+    end
+    for ends in (["2019-01-01T05:00:00"], ["2019-01-01T04:00:00"],
+                 ["2019-01-01T06:00:00", "2019-01-01T06:00:00"],
+                 ["2019-01-01T07:00:00", "2019-01-01T06:00:00"])
+        with_time_fixture(; ends) do path, cfg, bdg, rows
+            @test_throws "timestamps must be strictly increasing" DECARB.load_tm(path, cfg, bdg)
+        end
+    end
+end
+
+@testset "UTC timestamps :: DST boundaries including the first interval" begin
+    for (start, ends, expected_local) in (
+        ("2018-03-11T07:00:00", ["2018-03-11T08:00:00", "2018-03-11T09:00:00"],
+         [DateTime(2018,3,11,3), DateTime(2018,3,11,4)]),
+        ("2018-11-04T06:00:00", ["2018-11-04T07:00:00", "2018-11-04T08:00:00"],
+         [DateTime(2018,11,4,1), DateTime(2018,11,4,2)]),
+        ("2018-11-04T05:00:00", ["2018-11-04T06:00:00", "2018-11-04T07:00:00"],
+         [DateTime(2018,11,4,1), DateTime(2018,11,4,1)]),
+    )
+        with_time_fixture(; start, ends, zone="America/Chicago") do path, cfg, bdg, rows
+            tm = DECARB.load_tm(path, cfg, bdg)
+            @test tm["TM"] == [1.0, 1.0]
+            @test tm["H"] == 2.0
+            @test tm["Date"] == expected_local
+            @test tm["Qlight"] == parse.(Float64, rows.pQlight)
+            @test tm["Sdni"] == parse.(Float64, rows.pSdni)
+        end
+    end
+end
+
+@testset "UTC timestamps :: solar uses the shared interval midpoint" begin
+    path = joinpath(CASE_SRC, "in")
+    cfg = DECARB.load_cfg(path)
+    bdg = DECARB.load_bdgii(path, DECARB.load_bdgi(path))
+    tm = DECARB.load_tm(path, cfg, bdg)
+    # Explicit hourly midpoints for the Boston fixture, rather than its ends.
+    midpoints = collect(DateTime(2019, 1, 1, 5, 30):Hour(1):DateTime(2019, 1, 2, 4, 30))
+    elevation, azimuth = DECARB.calculate_sun_position(midpoints, bdg["Balt"], bdg["Blat"], bdg["Blon"])
+    @test tm["Pmidutc"] == midpoints
+    @test tm["ele"] ≈ elevation
+    @test tm["azi"] ≈ azimuth
+    endpoint_elevation, _ = DECARB.calculate_sun_position(tm["Putc"], bdg["Balt"], bdg["Blat"], bdg["Blon"])
+    @test maximum(abs.(tm["ele"] - endpoint_elevation)) > 0.01
+    pv = DECARB.load_pv(path, tm, bdg)
+    bdg["Btz"] = "America/Chicago"
+    other = DECARB.load_tm(path, cfg, bdg)
+    @test other["Date"] != tm["Date"]
+    for key in ("Putc", "Pmidutc", "TM", "H", "Qlight", "Qequip", "Sdni", "Sdhi", "ele", "azi", "Q_R")
+        @test other[key] == tm[key]
+    end
+    @test DECARB.load_pv(path, other, bdg)["pv_cf"] == pv["pv_cf"]
+end
+
+@testset "UTC timestamps :: annual examples have 8760 elapsed hours" begin
+    for case in ("annual", "investment")
+        path = joinpath(@__DIR__, "..", "examples", case, "in")
+        cfg = DECARB.load_cfg(path)
+        bdg = DECARB.load_bdgii(path, DECARB.load_bdgi(path))
+        tm = DECARB.load_tm(path, cfg, bdg)
+        @test cfg["P0"] == DateTime(2018, 1, 1, 5)
+        @test tm["Putc"][1] == DateTime(2018, 1, 1, 6)
+        @test tm["Putc"][end] == DateTime(2019, 1, 1, 5)
+        @test tm["P"] == 8760
+        @test all(==(1.0), tm["TM"])
+        @test tm["H"] == sum(tm["TM"]) == 8760.0
+        source = CSV.read(read(joinpath(path, "tm.csv")), DataFrame)
+        @test tm["Qlight"] == source.pQlight
+        @test tm["Sdni"] == source.pSdni
+        @test tm["Sdhi"] == source.pSdhi
+        @test tm["Tout"] == source.pTout
+    end
+end
+
+@testset "input files :: common loading and validation" begin
+    test_input_files()
+end
+
+@testset "validation :: finite values and numeric bounds" begin
+    test_input_bounds()
+end
+
+@testset "solver API :: generic MOI defaults and Gurobi tuning" begin
+    generic = RecordingOptimizer("Industrial MIP")
+    DECARB.configure_solver!(direct_model(generic), 1//1000, 60)
+    @test generic.attributes == Dict(
+        MOI.RelativeGapTolerance() => 0.001,
+        MOI.TimeLimitSec() => 60.0,
+    )
+
+    gurobi = RecordingOptimizer("Gurobi Optimizer")
+    DECARB.configure_solver!(direct_model(gurobi), 0.002, 90)
+    @test MOI.get(gurobi, MOI.RawOptimizerAttribute("MIPGap")) == 0.002
+    @test MOI.get(gurobi, MOI.RawOptimizerAttribute("TimeLimit")) == 90
+    @test MOI.get(gurobi, MOI.RawOptimizerAttribute("MIPFocus")) == 1
+    @test !haskey(gurobi.attributes, MOI.RelativeGapTolerance())
+end
+
+@testset "solver API :: factory, overrides, quiet MIP without duals" begin
+    p = stage(run=false)
+    calls = Ref(0)
+    factory = () -> begin
+        calls[] += 1
+        HiGHS.Optimizer()
+    end
+    mktemp() do _, io
+        result = redirect_stdout(io) do
+            @test_logs DECARB.run_decarb!(p; optimizer=factory,
+                attributes=Dict{Any,Any}("mip_rel_gap"=>0.002,
+                    MOI.TimeLimitSec()=>90.0),
+                mip_gap=0.1, time_limit=120, duals=false, verbose=false)
+        end
+        seekstart(io)
+        @test isempty(read(io, String))
+        @test calls[] == 1
+        @test get_attribute(result.model, "mip_rel_gap") == 0.002
+        @test get_attribute(result.model, MOI.TimeLimitSec()) == 90.0
+        @test get_attribute(result.model, MOI.Silent())
+        @test primal_status(result.model) == MOI.FEASIBLE_POINT
+        @test any(is_binary, all_variables(result.model))
+        @test all(iszero, Matrix(readout(p, "ts.csv")[:, [:dualQ, :dualT, :dualHW]]))
+    end
+end
+
+@testset "solver API :: optimizer_with_attributes and relaxed solve" begin
+    p = stage(run=false)
+    optimizer = optimizer_with_attributes(HiGHS.Optimizer, "presolve"=>"off")
+    result = DECARB.run_decarb!(p; optimizer,
+        attributes=Dict("presolve"=>"on"),
+        relax_integrality=true, verbose=false)
+    @test get_attribute(result.model, "presolve") == "on"
+    @test get_attribute(result.model, "mip_rel_gap") == 1e-4
+    @test !any(v -> is_binary(v) || is_integer(v), all_variables(result.model))
+    @test has_duals(result.model)
+    @test any(!iszero, readout(p, "ts.csv").dualQ)
+    disabled_duals, _ = DECARB.read_econ(result.model, result.tm; duals=false)
+    @test all(iszero, Matrix(disabled_duals))
+end
+
+@testset "solver API :: optional dual re-solve" begin
+    for (relax, duals, expected_solves) in ((false,false,1), (false,true,2),
+                                          (true,false,1), (true,true,1))
+        model = Model(HiGHS.Optimizer)
+        # Keep the thread count consistent with the process-wide HiGHS scheduler
+        # initialized by the preceding case runs.
+        DECARB.configure_solver!(model, 1e-4, 30.0)
+        set_silent(model)
+        @variable(model, x, Bin)
+        @constraint(model, x >= 0.5)
+        @objective(model, Min, x)
+        calls = Ref(0)
+        set_optimize_hook(model, m -> begin
+            calls[] += 1
+            optimize!(m; ignore_optimize_hook=true)
+        end)
+        DECARB.solve_model!(tempdir(), model, relax; duals, verbose=false)
+        @test calls[] == expected_solves
+        @test value(x) ≈ (relax ? 0.5 : 1.0)
+        @test is_binary(x) == (!relax && !duals)
+        @test has_duals(model) == (relax || duals)
+    end
+end
+@testset "temperature validation :: comfort, capacity, and selection" begin
+    f = temperature_fixture()
+    before = deepcopy(f)
+    report = DECARB.check_temperature(values(f)...)
+    @test f == before
+    @test report.free_temperature ≈ [21.0,21.9,22.71]
+    @test report.conflict.period == 3
+    @test report.conflict.direction == "cooling"
+    @test report.conflict.lower ≈ 22.71
+    @test report.conflict.required_upper == 22.0
+
+    f.cfg["NSTcost"] = 1.0
+    @test DECARB.check_temperature(values(f)...).conflict === nothing
+    f.cfg["NSTcost"] = 0.0
+    f.tm["Ton"] .= 0
+    @test DECARB.check_temperature(values(f)...).conflict === nothing
+    f.tm["Ton"] .= 1
+    f.hvac["ACmx"][1] = 2.0
+    f.sp["HVACz0"][1] = 0
+    @test DECARB.check_temperature(values(f)...).conflict !== nothing
+    f.sp["HVACyn"][1] = "YES"
+    @test DECARB.check_temperature(values(f)...).conflict === nothing
+    f.bdg["Bhvac"] = 0
+    @test DECARB.check_temperature(values(f)...).conflict !== nothing
+
+    f = temperature_fixture()
+    f.tm["Tout"] .= 0
+    @test DECARB.check_temperature(values(f)...).conflict.direction == "heating"
+    f.hvac["HVmx"][1] = 4.0
+    @test DECARB.check_temperature(values(f)...).conflict === nothing
+end
+
+@testset "temperature validation :: gains and calibration" begin
+    f = temperature_fixture()
+    f.bdg["Bk1"] = 0.0
+    f.bdg["Bk2"] = 0.5
+    f.bdg["Bk3"] = 2.0
+    f.bdg["Btime"] = 0.25
+    f.tm["TM"] = [0.25,0.75,0.25]
+    f.tm["Q_R"] .= 2
+    f.tm["Qihg_P"] .= 1
+    f.tm["Ton"] .= 0
+    report = DECARB.check_temperature(values(f)...)
+    @test report.free_temperature ≈ [23.0,32.0,35.0]
+    @test report.conflict.period == 2
+    @test report.conflict.required_upper == 30.0 # Outdoor-derived bound still applies.
+
+    f.bdg["Bk1"] = 0.5
+    f.bdg["Bk2"] = f.bdg["Bk3"] = 0.0
+    f.tm["TM"] = [1.0,0.25,0.5]
+    f.tm["Tout"] .= 0
+    @test DECARB.check_temperature(values(f)...).free_temperature ≈ [1.25,0.625,0.15625]
+
+    f.bdg["Bk1"] = 1.0
+    f.cfg["Tin0"] = 40.0
+    @test DECARB.check_temperature(values(f)...).conflict === nothing
+end
+
+@testset "temperature validation :: derating uses resulting temperature" begin
+    cold = DECARB.temperature_at_capacity(20.0,0.5,35.0,[2.0],[0.02],0.0; cooling=true)
+    heat = DECARB.temperature_at_capacity(20.0,0.5,0.0,[2.0],[0.02],0.0; cooling=false)
+    @test cold ≈ (20.0-0.5*2.0*(1-0.02*35.0))/(1+0.5*2.0*0.02) atol=1e-10
+    @test heat ≈ (20.0+0.5*2.0)/(1+0.5*2.0*0.02) atol=1e-10
+end
+
+@testset "temperature validation :: alternative thermal supplies" begin
+    f = temperature_fixture()
+    f.abp["ty"] = ["Chiller-1"]
+    f.abp["mx"] = [2.0]
+    f.sp["ABP0"], f.sp["ABPz0"], f.sp["ABPyn"] = ["Chiller"], [0], ["YES"]
+    @test DECARB.check_temperature(values(f)...).conflict === nothing
+
+    f = temperature_fixture()
+    f.tm["Tout"] .= 0
+    f.chp["ty"], f.chp["mx"], f.chp["h2p"] = ["Boiler-1"], [3.0], [0.0]
+    f.sp["CHP0"], f.sp["CHPz0"], f.sp["CHPyn"] = ["Boiler"], [1], ["NO"]
+    f.topo["chp_bdg"] = [0.8 0.0]
+    @test DECARB.check_temperature(values(f)...).conflict === nothing
+    f.topo["chp_bdg"][1,1] = 0
+    @test DECARB.check_temperature(values(f)...).conflict !== nothing
+end
+
+@testset "temperature validation :: integrated warnings and guards" begin
+    p = stage(run=false, patches=Dict(
+        "cfg.csv" => ["pNSTcost,1.0" => "pNSTcost,0.0", "pTin0,20.0" => "pTin0,19.0"],
+        "sp.csv" => "HP-MINISPLIT,1,NO" => "HP-MINISPLIT,0,NO",
+    ))
+    path = joinpath(p, "in")
+    io = IOBuffer()
+    inputs = load_fixture(path)
+    DECARB.validate_inputs(values(inputs)...; io)
+    message = String(take!(io))
+    @test occursin("temperature precheck: insufficient heating", message)
+    @test occursin(string(inputs.tm["Date"][1]), message)
+    input = joinpath(path, "bdg_ii.csv")
+    header = "pBk1,pBk2,pBk3,pBtime\n"
+    write(input, header * "-0.1,0.05,0.15,1\n")
+    @test_throws "pBk1 must be in [0,1]" DECARB.validate_inputs(values(load_fixture(path))...; io=devnull)
+    for hours in ("", "0", "-1", "NaN", "Inf", "invalid")
+        write(input, header * "0.1,0.05,0.15,$hours\n")
+        if hours == "invalid"
+            @test_logs (:warn, r"error parsing Float64") @test_throws "pBtime must be a positive, finite number" DECARB.validate_inputs(values(load_fixture(path))...; io=devnull)
+        else
+            @test_throws "pBtime must be a positive, finite number" DECARB.validate_inputs(values(load_fixture(path))...; io=devnull)
+        end
+    end
+    write(input, "pBk1,pBk2,pBk3\n0.1,0.05,0.15\n")
+    try
+        @test_throws Exception DECARB.load_bdgii(path, Dict())
+    finally
+        # Release CSV memory mappings before rewriting the file on Windows.
+        GC.gc()
+    end
+    write(input, header * "1,0.05,0.15,1\n")
+    config = joinpath(path, "cfg.csv")
+    write(config, replace(read(config, String), "pTin0,19.0" => "pTin0,100.0"))
+    # Initial temperature is not a modeled period.
+    @test DECARB.validate_inputs(values(load_fixture(path))...; io=devnull) === nothing
+end
+
+@testset "temperature validation :: annual investment diagnostic" begin
+    path = joinpath(@__DIR__, "..", "examples", "investment", "in")
+    cfg = DECARB.load_cfg(path)
+    sp = DECARB.load_sp(path,cfg)
+    bdg = DECARB.load_bdgii(path,DECARB.load_bdgi(path))
+    # Reproduce the 15-minute calibration used by the original diagnostic,
+    # without modifying the bundled case's calibration or catalog files.
+    bdg["Btime"] = 0.25
+    tm = DECARB.load_tm(path,cfg,bdg)
+    chp,abp,hvac,_,_ = DECARB.load_extended_catalog(path,tm,sp,bdg)
+    topo = DECARB.load_topo(path,chp,abp)
+    report = DECARB.check_temperature(cfg,tm,bdg,sp,chp,abp,hvac,topo)
+    @test report.conflict !== nothing
+    @test report.conflict.direction == "cooling"
+    @test maximum(report.free_temperature) > maximum(tm["Tout"])
+    hvac["ACmx"] .*= 2
+    @test DECARB.check_temperature(cfg,tm,bdg,sp,chp,abp,hvac,topo).conflict === nothing
+end
+@testset "thermal inputs :: bdg_ii schema and values" begin
+    mktempdir() do case_path
+        cp(CASE_SRC, case_path; force=true)
+        path = joinpath(case_path, "in")
+        input = joinpath(path, "bdg_ii.csv")
+        header = "pBk1,pBk2,pBk3,pBtime\n"
+        expected = Dict("Bk1" => 0.03, "Bk2" => 0.05, "Bk3" => 0.15, "Btime" => 1.0)
+
+        function check_error(contents, message)
+            write(input, contents)
+            inputs = if occursin("invalid", contents)
+                @test_logs (:warn, r"error parsing Float64") load_fixture(path)
+            else
+                @test_logs load_fixture(path)
+            end
+            original = deepcopy(inputs)
+            err = try
+                DECARB.validate_inputs(values(inputs)...; io=devnull)
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            if err isa ArgumentError
+                @test err.msg == message
+            end
+            @test isequal(inputs, original)
+        end
+
+        @testset "named columns" begin
+            for contents in (
+                header * "0.03,0.05,0.15,1\n",
+                "pBtime,pBk3,pBk1,pBk2\n1,0.15,0.03,0.05\n",
+            )
+                write(input, contents)
+                @test DECARB.validate_inputs(values(load_fixture(path))...; io=devnull) === nothing
+                bdg = Dict{String,Any}("existing" => 42)
+                @test DECARB.load_bdgii(path, bdg) === bdg
+                @test bdg["existing"] == 42
+                @test bdg == merge(expected, Dict("existing" => 42))
+                @test all(bdg[key] isa Float64 for key in keys(expected))
+            end
+        end
+
+        @testset "malformed CSV fails during loading" begin
+            columns = ["pBk1", "pBk2", "pBk3", "pBtime"]
+            values = ["0.03", "0.05", "0.15", "1"]
+            for omitted in eachindex(columns)
+                keep = setdiff(eachindex(columns), [omitted])
+                write(input, join(columns[keep], ',') * "\n" * join(values[keep], ',') * "\n")
+                try
+                    @test_throws Exception DECARB.load_bdgii(path, Dict())
+                finally
+                    GC.gc()
+                end
+            end
+            # Native CSV/indexing errors are allowed; the loader is unchanged.
+            for contents in (header, "",
+                "note,pBk2,pBtime,pBk1,pBk3\ncalibrated,0.05,1,0.03,0.15\n")
+                write(input, contents)
+                try
+                    @test_throws Exception DECARB.load_bdgii(path, Dict())
+                finally
+                    # Parser exceptions can bypass CSV's memory-map cleanup.
+                    GC.gc()
+                end
+            end
+        end
+
+        @testset "calibration interval" begin
+            for hours in ("", "0", "-1", "NaN", "Inf", "-Inf", "invalid")
+                check_error(header * "0.03,0.05,0.15,$hours\n",
+                    "bdg_ii.pBtime must be a positive, finite number")
+            end
+            write(input, header * "0.03,0.05,0.15,0.25\n")
+            @test DECARB.validate_inputs(values(load_fixture(path))...; io=devnull) === nothing
+            @test DECARB.load_bdgii(path, Dict())["Btime"] == 0.25
+        end
+
+        @testset "coefficients" begin
+            for value in ("", "-0.1", "1.1", "NaN", "Inf", "-Inf", "invalid")
+                check_error(header * "$value,0.05,0.15,1\n",
+                    "bdg_ii.pBk1 must be in [0,1] for timestep resampling")
+            end
+            for (column, row) in (("pBk2", v -> "0.03,$v,0.15,1\n"),
+                                  ("pBk3", v -> "0.03,0.05,$v,1\n"))
+                for value in ("", "NaN", "Inf", "-Inf", "invalid")
+                    check_error(header * row(value), "bdg_ii.$column must be finite")
+                end
+            end
+            # A malformed first row must not be silently discarded.
+            check_error(header * ",0.05,0.15,1\n0.03,0.05,0.15,1\n",
+                "bdg_ii.pBk1 must be in [0,1] for timestep resampling")
+            for k1 in (0.0, 1.0)
+                write(input, header * "$k1,0,-0.15,1\n")
+                @test DECARB.validate_inputs(values(load_fixture(path))...; io=devnull) === nothing
+                loaded = DECARB.load_bdgii(path, Dict())
+                @test loaded ==
+                    Dict("Bk1" => k1, "Bk2" => 0.0, "Bk3" => -0.15, "Btime" => 1.0)
+            end
+        end
+    end
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+@testset "validation :: loaded inputs need no source files" begin
+    path, inputs = mktempdir() do path
+        cp(CASE_SRC, path; force=true)
+        return path, load_fixture(joinpath(path, "in"))
+    end
+    @test !ispath(path)
+    original = deepcopy(inputs)
+    @test DECARB.validate_inputs(values(inputs)...; io=devnull) === nothing
+    @test isequal(inputs, original)
+    inputs.bdg["Btime"] = 0.0
+    original = deepcopy(inputs)
+    @test_throws "pBtime must be a positive, finite number" DECARB.validate_inputs(values(inputs)...; io=devnull)
+    @test isequal(inputs, original)
+end
+
+@testset "thermal inputs :: case validates after loading" begin
+    p = stage(run=false)
+    input = joinpath(p, "in", "bdg_ii.csv")
+    header = "pBk1,pBk2,pBk3,pBtime\n"
+    for (contents, message) in (
+        ((header * "0.03,0.05,0.15,$hours\n",
+          "bdg_ii.pBtime must be a positive, finite number")
+         for hours in ("", "0", "-1", "NaN", "Inf"))...,
+    )
+        write(input, contents)
+        err = try
+            DECARB.run_decarb!(p; verbose=false)
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        if err isa ArgumentError
+            @test err.msg == message
+        end
+    end
+end
+
+@testset "minimal :: runs and writes outputs" begin
+    p = stage()
+    for f in ("eq1.csv", "eq2.csv", "ts.csv")
+        @test isfile(joinpath(p, "out", f))
+    end
+    # balance.csv is written ONLY when the electricity balance fails to close
+    @test !isfile(joinpath(p, "out", "balance.csv"))
+    @test !isfile(joinpath(p, "out", "iis_constraints.txt"))
+end
+
+@testset "minimal :: time series integrity" begin
+    p  = stage()
+    ts = readout(p, "ts.csv")
+
+    @test nrow(ts) == 24
+    @test !any(ismissing, Matrix(ts))
+    @test ts.Date[1] == "01/01/2019 01:00"
+    @test names(ts)[1] == "Date"
+    @test !any(n -> n in ("DateUTC", "DateLocal", "DurationHours"), names(ts))
+    eq2 = readout(p, "eq2.csv")
+    @test all(==(ts.Date[1]), eq2.Date)
+    @test names(eq2) == ["Eq", "Inv", "Qty", "New", "CAPEX", "Date"]
+
+    # electricity balance, recomputed independently of the model
+    bal = ts.dem .+ ts.sell .+ ts.hvac_HT .+ ts.hvac_AC .+ ts.Qwh .+
+          ts.bess_UP .+ ts.ev_UP .-
+          ts.buy .- ts.pv .- ts.wind .- ts.chp .-
+          ts.bess_DN .- ts.ev_DN .- ts.nse
+    @test maximum(abs.(bal)) < 0.1          # matches write_outputs tolerance
+
+    # deselected technologies must contribute nothing
+    @test all(iszero, ts.chp)
+    @test all(iszero, ts.wind)
+    @test all(iszero, ts.bess_UP) && all(iszero, ts.bess_DN)
+    @test all(iszero, ts.ev_UP)   && all(iszero, ts.ev_DN)
+    @test all(iszero, ts.bess_SOC)          # guards §0.4 regression
+    @test all(iszero, ts.WHsoc)             # guards §0.3 regression (tankless)
+
+    # selected technologies must do something
+    @test sum(ts.hvac_HT) > 0               # winter day -> heating
+    @test sum(ts.pv)      > 0               # daylight hours present
+    @test sum(ts.buy)     > 0
+
+    # indoor temperature stays inside the comfort band (slack exists but is priced)
+    @test all(ts.Temp .>= 19.0)
+    @test all(ts.Temp .<= 26.5)
+
+    # duals recovered from the fixed-integer re-solve
+    @test any(!iszero, ts.dualQ)
+end
+
+# Outdoor temperature contributes in the current period; this case disables
+# solar and internal-gain terms. The hourly transition applies once per period.
+@testset "thermal recurrence :: current weather" begin
+    p = stage(patches = Dict(
+        "cfg.csv"    => "pTmode,true" => "pTmode,false",
+        "bdg_ii.csv" => "0.03,0.05,0.15,1" => "0.5,0.0,0.0,1.0",
+    ))
+    ts = readout(p, "ts.csv")
+
+    @test ts.Temp[1] ≈ 9.5 atol = 1e-6
+    @test ts.Temp[2] ≈ 4.0 atol = 1e-6
+end
+
+@testset "thermal recurrence :: user calibration interval" begin
+    p = stage(patches = Dict(
+        "cfg.csv"    => "pTmode,true" => "pTmode,false",
+        "bdg_ii.csv" => "0.03,0.05,0.15,1" => "0.5,0.0,0.0,0.25",
+    ))
+    ts = readout(p, "ts.csv")
+
+    # 15-minute coefficients are compounded four times per one-hour period.
+    @test ts.Temp[1] ≈ 0.31 atol = 1e-6
+    @test ts.Temp[2] ≈ -1.39 atol = 1e-6
+end
+
+# Active-equipment outputs are modeled as period energy. The thermal
+# recurrence must divide that energy by the period duration to recover kW.
+@testset "thermal recurrence :: equipment output enters as power" begin
+    p = stage(patches = Dict(
+        "tm.csv" => "2019-01-01T06:00:00" => "2019-01-01T05:15:00",
+        "bdg_ii.csv" => "0.03,0.05,0.15,1" => "0.03,0.0,0.15,0.25",
+    ))
+    ts = readout(p, "ts.csv")
+
+    ihg = ts.IHGp[1] + ts.IHGl[1] + ts.IHGe[1]
+    predicted = 20.0 + 0.03*(-1.0 - 20.0) +
+                0.15*(ts.HVACht[1]/0.25 + ihg)
+    @test ts.HVACht[1] > 0
+    @test ts.Temp[1] ≈ predicted atol = 0.02
+end
+
+@testset "minimal :: gas path and emissions" begin
+    p  = stage()
+    ts = readout(p, "ts.csv")
+    e1 = readout(p, "eq1.csv")
+
+    # gas water heater must consume gas and serve the DHW demand
+    @test sum(ts.Gwh)  > 0
+    @test sum(ts.WHhw) > 0
+    @test sum(ts.HWns) ≈ 0 atol = 1e-6      # demand fully served
+    active = ts.WHhw .> 0
+    @test ts.Gwh[active] ≈ ts.WHhw[active] ./ (0.95 * 0.82) atol = 0.02
+    @test all(iszero, ts.Gchp) && all(iszero, ts.Gabp)
+
+    val(n) = only(e1.eq[e1.name .== n])
+    @test val("direct_emissions")   > 0     # gas combustion
+    @test val("indirect_emissions") > 0     # grid imports
+    @test val("fuel_purchases")     > 0
+end
+
+@testset "minimal :: equipment report, all brownfield" begin
+    p   = stage()
+    eq2 = readout(p, "eq2.csv")
+
+    @test Set(eq2.Eq) == Set(["HP-MINISPLIT", "WH-TANKLESS-GAS", "PV-MONO"])
+    # nothing is newly built: pIT = 0 disables investment
+    @test all(iszero, eq2.New)
+    @test all(iszero, eq2.CAPEX)
+    @test only(eq2.Qty[eq2.Eq .== "PV-MONO"]) == 4
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression guard for the read_thermal aggregation defect (§3.1, last review).
+# Two existing units of ONE type must yield ONE row with Qty=2, New=0, CAPEX=0.
+# Current code emits two duplicate rows with New=[0,2].
+@testset "multiunit :: no duplicate equipment rows" begin
+    p = stage(patches = Dict(
+        "sp.csv"    => "HP-MINISPLIT,1,NO"  => "HP-MINISPLIT,2,NO",
+        "bdg_i.csv" => "pBhvac,1"           => "pBhvac,2",
+    ))
+    eq2 = readout(p, "eq2.csv")
+
+    hp = eq2[eq2.Eq .== "HP-MINISPLIT", :]
+    @test nrow(hp) == 1                       # one row per (type, window)
+    @test only(hp.Qty) == 2
+    @test only(hp.New) == 0                   # both units pre-existing
+    @test only(hp.CAPEX) == 0
+
+    # no (Eq, Date) pair may repeat anywhere in this fixture
+    @test nrow(unique(eq2[:, [:Eq, :Date]])) == nrow(eq2)
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Solve across spring DST on an uninterrupted UTC chronology.
+@testset "dst_transition :: spring forward" begin
+    patches = Dict(
+        "cfg.csv" => "pP0,2019-01-01T05:00:00" => "pP0,2019-03-10T05:00:00",
+        "tm.csv"  => ["2019-01-01T" => "2019-03-10T",
+                      "2019-01-02T" => "2019-03-11T"],
+    )
+    ts = readout(stage(; patches), "ts.csv")
+    @test nrow(ts) == 24
+    @test ts.Date[1:3] == ["03/10/2019 01:00", "03/10/2019 03:00", "03/10/2019 04:00"]
+end
+
+@testset "dst_transition :: fall back output" begin
+    p = stage(run=false, patches=Dict(
+        "cfg.csv" => "pP0,2019-01-01T05:00:00" => "pP0,2019-11-03T04:00:00",
+    ))
+    file = joinpath(p, "in", "tm.csv")
+    rows = CSV.read(read(file), DataFrame; types=String)
+    rows.pP = string.(
+        collect(DateTime(2019,11,3,5):Hour(1):DateTime(2019,11,4,4)))
+    CSV.write(file, rows)
+    result = DECARB.run_decarb!(p; mip_gap=MIP_GAP, time_limit=TLIMIT, verbose=false)
+    ts = readout(p, "ts.csv")
+    @test all(==(1.0), result.tm["TM"])
+    @test result.tm["H"] == 24.0
+    @test ts.Date[1:2] == ["11/03/2019 01:00", "11/03/2019 01:00"]
+    @test length(unique(result.tm["Putc"])) == 24
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input validation: a name in sp.csv with no surviving catalogue row must
+# produce a readable message, not DimensionMismatch (§B5 root cause).
+@testset "validation :: unknown equipment name" begin
+    err = try
+        stage(patches = Dict("sp.csv" => "HP-MINISPLIT,1,NO" => "NO-SUCH-UNIT,1,NO"))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("NO-SUCH-UNIT", sprint(showerror, err))
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversion factors are efficiencies: useful output divided by fcf gives
+# purchased fuel, and fuel-consuming equipment cannot exceed unity.
+@testset "validation :: selected equipment with zero capacity" begin
+    for (prefix, file) in (("CHP", "chp"), ("ABP", "abp"), ("HVAC", "hvac"),
+                           ("WH", "wh"), ("EV", "ev"))
+        p = stage(run=false)
+        path = joinpath(p, "in")
+        catalog_path = joinpath(path, "$file.csv")
+        catalog = CSV.read(catalog_path, DataFrame)
+        selection = CSV.read(joinpath(path, "sp.csv"), DataFrame; types=String)
+        selection[1, Symbol("p$(prefix)0")] = catalog.ty[1]
+        CSV.write(joinpath(path, "sp.csv"), selection)
+        for column in (prefix == "HVAC" ? (:pHVmx, :pACmx) : (:mx,))
+            catalog[!, column] .= 0
+        end
+        CSV.write(catalog_path, catalog)
+        @test_throws "equipment \"$(catalog.ty[1])\" is selected in sp.csv but absent" DECARB.validate_inputs(values(load_fixture(path))...; io=devnull)
+    end
+end
+
+@testset "validation :: fuel conversion factors are efficiencies" begin
+    err = try
+        stage(patches = Dict(
+            "wh.csv" => "WH-TANKLESS-GAS,12.0,0.82,G" =>
+                        "WH-TANKLESS-GAS,12.0,1.20,G",
+        ))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("fcf must be in (0,1]", sprint(showerror, err))
+end
+
+# Existing equipment incurs fixed O&M, but its capital cost is sunk.
+@testset "economic summary :: existing capital is sunk" begin
+    p  = stage()
+    e1 = readout(p, "eq1.csv")
+    val(n) = only(e1.eq[e1.name .== n])
+    @test "total_cost" in e1.name
+    @test val("equipment_annuity") ≈ sum(val(n) for n in (
+        "chp_annuity", "hvac_annuity", "abp_annuity", "water_heater_annuity",
+        "pv_annuity", "wind_annuity", "battery_annuity")) atol = 0.02
+    @test val("equipment_annuity") == 0
+    @test val("fixed_om_cost") > 0
+    @test val("equipment_annuity") != val("fixed_om_cost")
+end
+
+# A unit selected by the model is new equipment and must incur both reported
+# CAPEX and a time-prorated annualized investment cost.
+@testset "economic summary :: new equipment pays annuity" begin
+    p = stage(patches = Dict(
+        "cfg.csv" => ["pIT,0" => "pIT,1",
+                      "pNSTcost,1.0" => "pNSTcost,1000.0"],
+        "sp.csv"  => "HP-MINISPLIT,1,NO" => "HP-MINISPLIT,0,YES",
+    ))
+    e1 = readout(p, "eq1.csv")
+    eq2 = readout(p, "eq2.csv")
+    val(n) = only(e1.eq[e1.name .== n])
+    hp = eq2[eq2.Eq .== "HP-MINISPLIT", :]
+
+    @test nrow(hp) == 1
+    @test only(hp.New) == 1
+    @test only(hp.CAPEX) > 0
+    @test val("hvac_annuity") > 0
+    @test val("water_heater_annuity") == 0
+    @test val("pv_annuity") == 0
+end
+
+# Existing integer-count DER stock belongs only to the first investment
+# window; enabling later investment windows must not duplicate it.
+@testset "investment windows :: existing DER stock is not repeated" begin
+    p = stage(patches = Dict(
+        "cfg.csv"   => "pIT,0" => "pIT,2",
+        "sp.csv"    => "PV-MONO,4,NO" => "PV-MONO,4,YES",
+        "bdg_i.csv" => "pBpv,20.0" => "pBpv,7.2",
+    ))
+    e1 = readout(p, "eq1.csv")
+    eq2 = readout(p, "eq2.csv")
+    pv = eq2[eq2.Eq .== "PV-MONO", :]
+
+    @test nrow(pv) == 1
+    @test only(pv.Qty) == 4
+    @test only(pv.New) == 0
+    @test only(pv.CAPEX) == 0
+    @test only(e1.eq[e1.name .== "pv_annuity"]) == 0
+end
+
+end # DECARB.jl
