@@ -100,15 +100,18 @@ function objective_function!(model::Model,cfg::Dict,tm::Dict,chp::Dict,abp::Dict
         (1-(1+cfg["IR"])^(-bess["life"][s]))*(model[:zBESS][i,s]-z0[i,s])
         for i=1:cfg["IT"],s=1:bess["N"]))
 
+    # Installed equipment remains active through the final modeled period.
+    active_hours = [sum(tm["TM"][t] for t=tm["IW"][i]:tm["P"]) for i=1:cfg["IT"]]
+
     # total fixed O&M costs (+) [$]
     @expression(model, COST_FOM,
-        sum(chp["fom"][c]*model[:bCHPty][i,c]*tm["H"]/8760 for i=1:cfg["IT"],c=1:chp["N"]) +
-        sum(abp["fom"][a]*model[:bABPty][i,a]*tm["H"]/8760 for i=1:cfg["IT"],a=1:abp["N"]) +
-        sum(hvac["fom"][h]*model[:bHVACty][i,h]*tm["H"]/8760 for i=1:cfg["IT"],h=1:hvac["N"]) +
-        sum(wh["fom"][w]*model[:bWHty][i,w]*tm["H"]/8760 for i=1:cfg["IT"],w=1:wh["N"]) +
-        sum(pv["fom"][v]*model[:zPV][i,v]*tm["H"]/8760 for i=1:cfg["IT"],v=1:pv["N"]) +
-        sum(wind["fom"][d]*model[:zWIND][i,d]*tm["H"]/8760 for i=1:cfg["IT"],d=1:wind["N"]) +
-        sum(bess["fom"][s]*model[:zBESS][i,s]*tm["H"]/8760 for i=1:cfg["IT"],s=1:bess["N"]))
+        sum(chp["fom"][c]*model[:bCHPty][i,c]*active_hours[i]/8760 for i=1:cfg["IT"],c=1:chp["N"]) +
+        sum(abp["fom"][a]*model[:bABPty][i,a]*active_hours[i]/8760 for i=1:cfg["IT"],a=1:abp["N"]) +
+        sum(hvac["fom"][h]*model[:bHVACty][i,h]*active_hours[i]/8760 for i=1:cfg["IT"],h=1:hvac["N"]) +
+        sum(wh["fom"][w]*model[:bWHty][i,w]*active_hours[i]/8760 for i=1:cfg["IT"],w=1:wh["N"]) +
+        sum(pv["fom"][v]*model[:zPV][i,v]*active_hours[i]/8760 for i=1:cfg["IT"],v=1:pv["N"]) +
+        sum(wind["fom"][d]*model[:zWIND][i,d]*active_hours[i]/8760 for i=1:cfg["IT"],d=1:wind["N"]) +
+        sum(bess["fom"][s]*model[:zBESS][i,s]*active_hours[i]/8760 for i=1:cfg["IT"],s=1:bess["N"]))
     # total variable O&M costs (+) [$]
     @expression(model, COST_VOM,
         sum(chp["vom"][c]*model[:vCHP_Q][t,c] for t=1:tm["P"],c=1:chp["N"]) +

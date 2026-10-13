@@ -974,6 +974,60 @@ end
     @test occursin("fcf must be in (0,1]", sprint(showerror, err))
 end
 
+# Compare identical installations in two windows for every equipment category.
+@testset "fixed O&M :: active investment duration" begin
+    for (durations, first_hours, second_hours) in (
+        ([1.0, 1.0, 1.0, 1.0], 4.0, 2.0),
+        ([0.25, 1.75, 0.5, 1.0], 3.5, 1.5),
+    )
+        model = Model()
+        cfg = Dict{String,Any}("IT"=>2, "IR"=>0.05, "QmxTM"=>0, "EVdriver"=>0,
+            "EVpen"=>0.0, "NSEcost"=>0.0, "NSTcost"=>0.0,
+            "NSHWcost"=>0.0, "NSEVcost"=>0.0, "Gco2"=>0.0, "Lco2"=>0.0)
+        tm = Dict{String,Any}("P"=>4, "TM"=>durations, "IW"=>[1, 3],
+            "H"=>first_hours, "QmxCostN"=>Float64[])
+        for key in ("HWdem", "QcostBuy", "QcostSell", "Gcost", "Lcost", "Qco2")
+            tm[key] = zeros(4)
+        end
+        for key in (:vNSE_Q, :vTup, :vTlo, :vNShw, :vQbuy, :vQsell,
+                    :vCHP_G, :vABP_G, :vWH_G, :vCHP_L, :vABP_L, :vWH_L)
+            model[key] = @variable(model, [1:4])
+        end
+        for key in (:vCHP_Q, :vABP_AC, :vHVAC_HT, :vHVAC_AC, :vWH_HW)
+            model[key] = @variable(model, [1:4, 1:1])
+        end
+        model[:vQmx] = @variable(model, [1:0])
+        model[:vEVlo] = @variable(model, [1:4, 1:0])
+        model[:vEVsoc] = @variable(model, [1:4, 1:0])
+        ev = Dict("N"=>0, "mx_eff"=>Float64[])
+        keys = (:bCHPty, :bABPty, :bHVACty, :bWHty, :zPV, :zWIND, :zBESS)
+        catalogs = [Dict("N"=>1, "fom"=>[100.0*k], "inv"=>[0.0],
+            "life"=>[20.0], "vom"=>[0.0]) for k in eachindex(keys)]
+        for (k, key) in enumerate(keys)
+            if k <= 4
+                model[key] = @variable(model, [1:2, 1:1], Bin)
+                set_upper_bound.(model[key], 1)
+            else
+                model[key] = @variable(model, [1:2, 1:1], lower_bound=0, upper_bound=3, integer=true)
+            end
+        end
+        chp, abp, hvac, wh, pv, wind, bess = catalogs
+        DECARB.objective_function!(model,cfg,tm,chp,abp,hvac,wh,pv,bess,ev,wind)
+
+        for (key, catalog) in zip(keys, catalogs)
+            @testset "$key :: $durations" begin
+                first, second = model[key][:, 1]
+                qty = is_binary(first) ? 1 : 2
+                first_cost = value(v -> v == first ? qty : 0.0, model[:COST_FOM])
+                second_cost = value(v -> v == second ? qty : 0.0, model[:COST_FOM])
+                @test first_cost ≈ only(catalog["fom"])*qty*first_hours/8760
+                @test second_cost ≈ only(catalog["fom"])*qty*second_hours/8760
+                @test second_cost < first_cost
+            end
+        end
+    end
+end
+
 # Existing equipment incurs fixed O&M, but its capital cost is sunk.
 @testset "economic summary :: existing capital is sunk" begin
     p  = stage()
@@ -985,6 +1039,10 @@ end
         "pv_annuity", "wind_annuity", "battery_annuity")) atol = 0.02
     @test val("equipment_annuity") == 0
     @test val("fixed_om_cost") > 0
+    inputs = load_fixture(joinpath(p, "in"))
+    expected_fom = (sum(inputs.hvac["fom"]) + sum(inputs.wh["fom"]) +
+        4*only(inputs.pv["fom"]))*inputs.tm["H"]/8760
+    @test val("fixed_om_cost") ≈ expected_fom atol = 0.005
     @test val("equipment_annuity") != val("fixed_om_cost")
 end
 
@@ -1026,6 +1084,10 @@ end
     @test only(pv.New) == 0
     @test only(pv.CAPEX) == 0
     @test only(e1.eq[e1.name .== "pv_annuity"]) == 0
+    inputs = load_fixture(joinpath(p, "in"))
+    expected_fom = (sum(inputs.hvac["fom"]) + sum(inputs.wh["fom"]) +
+        4*only(inputs.pv["fom"]))*inputs.tm["H"]/8760
+    @test only(e1.eq[e1.name .== "fixed_om_cost"]) ≈ expected_fom atol = 0.005
 end
 
 end # DECARB.jl
