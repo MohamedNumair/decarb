@@ -9,7 +9,7 @@ the latest published release.
 
 Do not open a public issue for a suspected vulnerability. Use GitHub's private
 vulnerability reporting feature for this repository. If that is unavailable,
-email `pduenas@mit.edu` with the subject `DECARB security report`.
+email `decarb-maintainers@mit.edu` with the subject `DECARB security report`.
 
 Include the affected version or commit, reproduction steps, impact, and any
 suggested mitigation. Please allow time for acknowledgement and investigation
