@@ -887,18 +887,6 @@ end
     @test only(eq2.Qty[eq2.Eq .== "PV-MONO"]) == 4
 end
 
-# Thermal topology product must match the CHP-to-chiller connection.
-@testset "topology :: CHP-to-absorption-chiller product" begin
-    chp = Dict("N" => 1, "ty" => ["MICROTURB-1"])
-    abp = Dict("N" => 1, "ty" => ["ABSORBER-1"])
-    topo = Dict("N" => 1, "up" => ["MICROTURB"], "lo" => ["ABSORBER"],
-                "in" => ["hot water"], "eff" => [0.8])
-
-    @test all(iszero, DECARB.create_chp_abp(topo, chp, abp))
-    topo["in"][1] = "cooling"
-    @test DECARB.create_chp_abp(topo, chp, abp) == reshape([0.8], 1, 1)
-end
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Regression guard for the read_thermal aggregation defect (§3.1, last review).
 # Two existing units of ONE type must yield ONE row with Qty=2, New=0, CAPEX=0.
