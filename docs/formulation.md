@@ -72,11 +72,11 @@ within configured tariff periods.
 
 Indoor temperature follows a first-order data-driven recurrence whose input
 coefficients `k1`, `k2`, and `k3` are calibrated over the interval specified by
-`time` in `bdg_ii.csv` (defaults to `0.25` hours when omitted). For a model 
-period of `TM[t]` hours, define:
+the required `pBtime` field in `bdg_ii.csv`. For a model period of `TM[t]`
+hours, define:
 
 ```text
-r[t]  = TM[t] / time
+r[t]  = TM[t] / pBtime
 k1[t] = 1 - (1 - k1)^r[t]
 s[t]  = k1[t] / k1
 k2[t] = s[t] k2

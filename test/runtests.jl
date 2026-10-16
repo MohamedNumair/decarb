@@ -863,6 +863,19 @@ end
     @test val("fuel_purchases")     > 0
 end
 
+@testset "water heater :: normalized tank state" begin
+    p = stage(patches = Dict(
+        "cfg.csv" => ["pWHsto0,0.5" => "pWHsto0,0.8",
+                      "pWHstof,0.5" => "pWHstof,0.8"],
+        "wh.csv" => "WH-TANKLESS-GAS,12.0,0.82,G,0.95,0.0" =>
+                    "WH-TANKLESS-GAS,12.0,0.82,G,0.95,0.5",
+    ))
+    ts = readout(p, "ts.csv")
+
+    @test all(0 .<= ts.WHsoc .<= 0.5)
+    @test ts.WHsoc[end] ≈ 0.4 atol = 0.01
+end
+
 @testset "minimal :: equipment report, all brownfield" begin
     p   = stage()
     eq2 = readout(p, "eq2.csv")
@@ -872,6 +885,18 @@ end
     @test all(iszero, eq2.New)
     @test all(iszero, eq2.CAPEX)
     @test only(eq2.Qty[eq2.Eq .== "PV-MONO"]) == 4
+end
+
+# Thermal topology product must match the CHP-to-chiller connection.
+@testset "topology :: CHP-to-absorption-chiller product" begin
+    chp = Dict("N" => 1, "ty" => ["MICROTURB-1"])
+    abp = Dict("N" => 1, "ty" => ["ABSORBER-1"])
+    topo = Dict("N" => 1, "up" => ["MICROTURB"], "lo" => ["ABSORBER"],
+                "in" => ["hot water"], "eff" => [0.8])
+
+    @test all(iszero, DECARB.create_chp_abp(topo, chp, abp))
+    topo["in"][1] = "cooling"
+    @test DECARB.create_chp_abp(topo, chp, abp) == reshape([0.8], 1, 1)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
