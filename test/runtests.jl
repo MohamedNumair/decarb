@@ -863,6 +863,19 @@ end
     @test val("fuel_purchases")     > 0
 end
 
+@testset "water heater :: normalized tank state" begin
+    p = stage(patches = Dict(
+        "cfg.csv" => ["pWHsto0,0.5" => "pWHsto0,0.8",
+                      "pWHstof,0.5" => "pWHstof,0.8"],
+        "wh.csv" => "WH-TANKLESS-GAS,12.0,0.82,G,0.95,0.0" =>
+                    "WH-TANKLESS-GAS,12.0,0.82,G,0.95,0.5",
+    ))
+    ts = readout(p, "ts.csv")
+
+    @test all(0 .<= ts.WHsoc .<= 0.5)
+    @test ts.WHsoc[end] ≈ 0.4 atol = 0.01
+end
+
 @testset "minimal :: equipment report, all brownfield" begin
     p   = stage()
     eq2 = readout(p, "eq2.csv")

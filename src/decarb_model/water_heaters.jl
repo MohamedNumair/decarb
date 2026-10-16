@@ -17,7 +17,7 @@ function water_heaters!(model::Model,cfg::Dict,tm::Dict,bdg::Dict,sp::Dict,wh::D
     # energy consumption for water heating [0,1]
     @variable(model, (!iszero).(wh["mx"][w]) >= vWHq[t=1:tm["P"],w=1:wh["N"]] >= 0)
     # tank level in water heater [0,1]
-    @variable(model, (!iszero).(wh["tank"][w]) >= vWHsoc[t=0:tm["P"],w=1:wh["N"]] >= 0)
+    @variable(model, 1 >= vWHsoc[t=0:tm["P"],w=1:wh["N"]] >= 0)
     # hot water demand from water heater [0,1]
     @variable(model, (!iszero).(wh["mx"][w]) >= vWHhw[t=1:tm["P"],w=1:wh["N"]] >= 0)
     # investment in water heater [0,1]
@@ -46,6 +46,9 @@ function water_heaters!(model::Model,cfg::Dict,tm::Dict,bdg::Dict,sp::Dict,wh::D
     wh["tank_eff"] = copy(wh["tank"])
     wh["mx_eff"][iszero.(upper_bound.(bWHty[1,:]))] .= 0
     wh["tank_eff"][iszero.(upper_bound.(bWHty[1,:]))] .= 0
+    for w in findall(iszero, wh["tank_eff"])
+        set_upper_bound.(vWHsoc[:,w], 0)
+    end
 
     # energy consumption for water heating [kWh]
     @expression(model, vWH_Q[t=1:tm["P"],w=1:wh["N"]], tm["TM"][t]*wh["mx_eff"][w]*vWHq[t,w])
