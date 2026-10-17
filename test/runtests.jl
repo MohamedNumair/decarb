@@ -887,16 +887,24 @@ end
     @test only(eq2.Qty[eq2.Eq .== "PV-MONO"]) == 4
 end
 
-# Thermal topology product must match the CHP-to-chiller connection.
-@testset "topology :: CHP-to-absorption-chiller product" begin
-    chp = Dict("N" => 1, "ty" => ["MICROTURB-1"])
-    abp = Dict("N" => 1, "ty" => ["ABSORBER-1"])
-    topo = Dict("N" => 1, "up" => ["MICROTURB"], "lo" => ["ABSORBER"],
-                "in" => ["hot water"], "eff" => [0.8])
+@testset "chp :: boiler fuel includes heat to absorption chiller" begin
+    cfg = Dict("IT" => 1)
+    tm = Dict("P" => 2, "TM" => [1.0, 1.0], "IW" => [1])
+    bdg = Dict("Bchp" => 1)
+    sp = Dict("CHP0" => ["BOILER"], "CHPz0" => [1], "CHPyn" => ["NO"])
+    chp = Dict("N" => 1, "ty" => ["BOILER-1"], "mx" => [100.0], "mn" => [0.0],
+               "fuel" => ["G"], "h2p" => [0.0], "fcf" => [0.9])
+    abp = Dict("N" => 1)
+    topo = Dict("chp_bdg" => zeros(1, 2), "chp_abp" => reshape([0.8], 1, 1))
 
-    @test all(iszero, DECARB.create_chp_abp(topo, chp, abp))
-    topo["in"][1] = "cooling"
-    @test DECARB.create_chp_abp(topo, chp, abp) == reshape([0.8], 1, 1)
+    model = Model()
+    DECARB.heat_connections!(model, topo, tm, chp, abp)
+    DECARB.chp_units!(model, cfg, tm, bdg, topo, sp, chp, abp)
+
+    for t in 1:tm["P"]
+        @test JuMP.coefficient(model[:vCHP_G][t], model[:vCHPabp][t, 1, 1]) > 0
+    end
+    @test JuMP.coefficient(model[:vCHP_G][1], model[:vCHPabp][2, 1, 1]) == 0
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
