@@ -238,7 +238,7 @@ be used consistently across every price and cost field.
 | `mx` | kW | Maximum cooling capacity. |
 | `fcf` | fraction | Direct-fuel conversion efficiency in `(0,1]`; use `0` when cooling is supplied only by CHP heat. |
 | `fuel` | code | `G` for gaseous or `L` for liquid fuel. |
-| `ac` | fraction | Cooling efficiency. |
+| `ac` | fraction | Cooling efficiency (cooling produced per unit of heat input). |
 | `inv` | $/unit | Capital cost. |
 | `fom` | $/(unit year) | Fixed operation and maintenance cost. |
 | `vom` | $/kWh | Variable operation and maintenance cost. |

@@ -907,6 +907,26 @@ end
     @test JuMP.coefficient(model[:vCHP_G][1], model[:vCHPabp][2, 1, 1]) == 0
 end
 
+@testset "abp :: CHP heat path uses the same cooling efficiency" begin
+    cfg = Dict("IT" => 1)
+    tm = Dict("P" => 1, "TM" => [1.0], "IW" => [1])
+    bdg = Dict("Babp" => 1)
+    sp = Dict("ABP0" => ["CHILLER"], "ABPz0" => [1], "ABPyn" => ["NO"])
+    chp = Dict("N" => 1, "mx_eff" => [100.0])
+    abp = Dict("N" => 1, "ty" => ["CHILLER-1"], "mx" => [50.0], "fuel" => ["G"],
+               "ac" => [0.7], "fcf" => [0.9])
+    topo = Dict("chp_bdg" => zeros(1, 2), "chp_abp" => reshape([0.8], 1, 1))
+
+    model = Model()
+    DECARB.heat_connections!(model, topo, tm, chp, abp)
+    DECARB.abp_chillers!(model, cfg, tm, bdg, topo, sp, chp, abp)
+
+    func = JuMP.constraint_object(model[:eABPq][1, 1]).func
+    # fuel path: unit coefficient; CHP path: ac * link efficiency * mx_chp / mx_abp
+    @test JuMP.coefficient(func, model[:vABPq][1, 1]) ≈ -1.0
+    @test JuMP.coefficient(func, model[:vCHPabp][1, 1, 1]) ≈ -0.7 * 0.8 * 100.0 / 50.0
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Regression guard for the read_thermal aggregation defect (§3.1, last review).
 # Two existing units of ONE type must yield ONE row with Qty=2, New=0, CAPEX=0.
