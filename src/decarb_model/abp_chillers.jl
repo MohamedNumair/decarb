@@ -92,6 +92,6 @@ function abp_chillers!(model::Model,cfg::Dict,tm::Dict,bdg::Dict,topo::Dict,sp::
     # heat consumption by absorption chiller [0,1]
     @constraint(model, eABPq[t=1:tm["P"],a=1:abp["N"]; abp["mx_eff"][a]>0],
         vABPac[t,a] <= vABPq[t,a] +
-        sum(topo["chp_abp"][c,a]*chp["mx_eff"][c]*model[:vCHPabp][t,c,a]/abp["mx_eff"][a] for c=1:chp["N"] if topo["chp_abp"][c,a]>0))
+        sum(abp["ac"][a]*topo["chp_abp"][c,a]*chp["mx_eff"][c]*model[:vCHPabp][t,c,a]/abp["mx_eff"][a] for c=1:chp["N"] if topo["chp_abp"][c,a]>0))
 
 end
