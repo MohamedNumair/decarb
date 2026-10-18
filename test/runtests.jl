@@ -887,6 +887,24 @@ end
     @test only(eq2.Qty[eq2.Eq .== "PV-MONO"]) == 4
 end
 
+@testset "minimal :: deselected BESS and wind types are fixed to zero" begin
+    p = stage(run = false)
+    r = DECARB.run_decarb!(p; mip_gap=MIP_GAP, time_limit=TLIMIT, verbose=false)
+    m = r.model
+
+    @test all(iszero, r.bess["zmx0"]) && all(iszero, r.wind["zmx0"])
+    for s in 1:r.bess["N"], t in 1:r.tm["P"]
+        @test is_fixed(m[:vBESSup][t,s]) && value(m[:vBESSup][t,s]) == 0
+        @test is_fixed(m[:vBESSdn][t,s]) && value(m[:vBESSdn][t,s]) == 0
+    end
+    for s in 1:r.bess["N"], t in 0:r.tm["P"]
+        @test is_fixed(m[:vBESSsoc][t,s]) && value(m[:vBESSsoc][t,s]) == 0
+    end
+    for d in 1:r.wind["N"], t in 1:r.tm["P"]
+        @test is_fixed(m[:vWINDq][t,d]) && value(m[:vWINDq][t,d]) == 0
+    end
+end
+
 @testset "chp :: boiler fuel includes heat to absorption chiller" begin
     cfg = Dict("IT" => 1)
     tm = Dict("P" => 2, "TM" => [1.0, 1.0], "IW" => [1])
