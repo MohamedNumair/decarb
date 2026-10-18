@@ -42,6 +42,13 @@ function bess_modules!(model::Model,cfg::Dict,tm::Dict,bdg::Dict,sp::Dict,bess::
         end
     end
 
+    # fix dispatch and state of unit types that cannot exist to zero
+    for s in findall(iszero, bess["zmx0"])
+        fix.(vBESSup[:,s], 0; force=true)
+        fix.(vBESSdn[:,s], 0; force=true)
+        fix.(vBESSsoc[:,s], 0; force=true)
+    end
+
     # electricity charged in BESS module [kWh]
     @expression(model, vBESS_UP[t=1:tm["P"],s=1:bess["N"]], bess["mx"][s]*vBESSup[t,s])
     # electricity discharged from BESS module [kWh]

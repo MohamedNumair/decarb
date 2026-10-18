@@ -35,6 +35,11 @@ function pv_panels!(model::Model,cfg::Dict,tm::Dict,bdg::Dict,sp::Dict,pv::Dict)
         end
     end
 
+    # fix dispatch of unit types that cannot exist to zero
+    for v in findall(iszero, pv["zmx0"])
+        fix.(vPV_Q[:,v], 0; force=true)
+    end
+
     # maximum available surface for PV panels [m2]
     @constraint(model, ePVbdg,
         sum(pv["ar"][v]*zPV[i,v] for i=1:cfg["IT"], v=1:pv["N"] if pv["zmx0"][v]>0) <= bdg["Bpv"])

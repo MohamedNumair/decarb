@@ -1,7 +1,8 @@
 """
 read_electric(model::Model,tm::Dict,n_chp::Int64,n_hvac::Int64,n_wh::Int64,
     n_pv::Int64,n_bess::Int64,n_ev::Int64,n_wind::Int64,BESSmx::Vector{Float64},
-    BESSzmx0::Vector{Int16},EVmx::Vector{Float64},WHfuel::Vector{String})
+    BESSzmx0::Vector{Int16},EVmx::Vector{Float64},WHfuel::Vector{String},
+    PVzmx0::Vector{Int16},WINDzmx0::Vector{Int16})
 
 Reads time series outputs related to electric demands and generations and
     load them into dataframe
@@ -17,7 +18,9 @@ n_bess      number of BESS module types
 n_ev        number of electric vehicle types
 n_wind      number of wind turbine types
 BESSmx      maximum battery capacity
-BESSzmx0    initial battery capacity
+BESSzmx0    maximum number of battery modules
+PVzmx0      maximum number of PV panels
+WINDzmx0    maximum number of wind turbines
 EVmx        maximum EV battery capacity
 WHfuel      type of fuel in water heater
 
@@ -26,7 +29,8 @@ returns dataframes of outputs
 
 function read_electric(model::Model,tm::Dict,n_chp::Int64,n_hvac::Int64,n_wh::Int64,
     n_pv::Int64,n_bess::Int64,n_ev::Int64,n_wind::Int64,BESSmx::Vector{Float64},
-    BESSzmx0::Vector{Int16},EVmx::Vector{Float64},WHfuel::Vector{String})
+    BESSzmx0::Vector{Int16},PVzmx0::Vector{Int16},WINDzmx0::Vector{Int16},
+    EVmx::Vector{Float64},WHfuel::AbstractVector{<:AbstractString})
 
     Qdem = tm["Qlight"] + tm["Qequip"]
     Qsell = round.(value.(model[:vQsell]), digits=2)
@@ -60,15 +64,18 @@ function read_electric(model::Model,tm::Dict,n_chp::Int64,n_hvac::Int64,n_wh::In
 
     # outputs from solar panels
     if n_pv > 0
-        PV_Q = round.(sum(value.(model[:vPV_Q][:,p]) for p=1:n_pv)./tm["TM"], digits=2)
+        PV_Q = round.(sum(value.(model[:vPV_Q][:,p]) for p=1:n_pv if PVzmx0[p]>0;
+                          init=zeros(Float64, tm["P"]))./tm["TM"], digits=2)
     else
         PV_Q = zeros(Float64, tm["P"])
     end
 
     # outputs from battery modules
     if n_bess > 0
-        BESS_UP = round.(sum(value.(model[:vBESS_UP][:,s]) for s=1:n_bess)./tm["TM"], digits=2)
-        BESS_DN = round.(sum(value.(model[:vBESS_DN][:,s]) for s=1:n_bess)./tm["TM"], digits=2)
+        BESS_UP = round.(sum(value.(model[:vBESS_UP][:,s]) for s=1:n_bess if BESSzmx0[s]>0;
+                             init=zeros(Float64, tm["P"]))./tm["TM"], digits=2)
+        BESS_DN = round.(sum(value.(model[:vBESS_DN][:,s]) for s=1:n_bess if BESSzmx0[s]>0;
+                             init=zeros(Float64, tm["P"]))./tm["TM"], digits=2)
         BESSsoc = zeros(Float64, tm["P"])										 
         for p=1:tm["P"]
             BESSsoc[p] = round.(sum(BESSmx[s]*value.(model[:vBESSsoc][p,s]) 
@@ -96,7 +103,8 @@ function read_electric(model::Model,tm::Dict,n_chp::Int64,n_hvac::Int64,n_wh::In
 
     # outputs from wind turbines
     if n_wind > 0
-        WIND_Q = round.(sum(value.(model[:vWIND_Q][:,p]) for p=1:n_wind)./tm["TM"], digits=2)
+        WIND_Q = round.(sum(value.(model[:vWIND_Q][:,p]) for p=1:n_wind if WINDzmx0[p]>0;
+                            init=zeros(Float64, tm["P"]))./tm["TM"], digits=2)
     else
         WIND_Q = zeros(Float64, tm["P"])
     end
