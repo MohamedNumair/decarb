@@ -466,12 +466,42 @@ end
             calls[] += 1
             optimize!(m; ignore_optimize_hook=true)
         end)
-        DECARB.solve_model!(tempdir(), model, relax; duals, verbose=false)
+        info = DECARB.solve_model!(tempdir(), model, relax; duals, verbose=false)
         @test calls[] == expected_solves
         @test value(x) ≈ (relax ? 0.5 : 1.0)
         @test is_binary(x) == (!relax && !duals)
         @test has_duals(model) == (relax || duals)
+        @test info.duals_available == duals
+        @test info.termination_status == MOI.OPTIMAL
+        @test info.primal_status == MOI.FEASIBLE_POINT
+        @test info.objective_value ≈ (relax ? 0.5 : 1.0)
+        @test isfinite(info.relative_gap) && info.solve_time >= 0
     end
+
+    # failed LP re-solve: restore the MIP, keep its solution, report no duals
+    model = Model(HiGHS.Optimizer)
+    DECARB.configure_solver!(model, 1e-4, 30.0)
+    set_silent(model)
+    @variable(model, x, Bin)
+    @constraint(model, x >= 0.5)
+    @objective(model, Min, x)
+    calls = Ref(0)
+    set_optimize_hook(model, m -> begin
+        calls[] += 1
+        # make the second (fixed-integer) solve infeasible
+        calls[] == 2 && fix(x, 0; force=true)
+        optimize!(m; ignore_optimize_hook=true)
+    end)
+    info = @test_logs (:warn, r"duals will be zero") DECARB.solve_model!(
+        tempdir(), model, false; duals=true, verbose=false)
+    @test calls[] == 3
+    @test !info.duals_available
+    @test info.objective_value ≈ 1.0       # captured before the re-solve
+    @test info.primal_status == MOI.FEASIBLE_POINT
+    @test !has_duals(model)
+    @test is_binary(x) && !is_fixed(x)
+    @test primal_status(model) == MOI.FEASIBLE_POINT
+    @test value(x) ≈ 1.0
 end
 @testset "temperature validation :: comfort, capacity, and selection" begin
     f = temperature_fixture()

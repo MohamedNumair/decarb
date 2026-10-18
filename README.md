@@ -18,7 +18,7 @@ linear program.
 
 ## Requirements
 
-- Julia 1.12 or newer
+- Julia 1.10 or newer
 - HiGHS, installed automatically as the default open-source solver
 - Optional: Gurobi and a valid Gurobi license
 
