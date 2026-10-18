@@ -3,12 +3,19 @@ solve_model!(path::AbstractString,model::Model,relax_int::Bool)
 
 Optimizes the model, checks feasibility, and writes an IIS report if infeasible. If the
 model is feasible, duals is true, and relax_int is false, integer/binary variables are fixed
-at their solution values and the model is re-solved relaxed to obtain dual information
+at their rounded solution values and the model is re-solved relaxed to obtain dual
+information. If that re-solve returns no feasible point, the original integrality is
+restored, the saved MIP solution is used as start values, the MIP is re-optimized, and
+duals are reported as unavailable.
 
 inputs:
 path            string path to working directory
 model           optimization model object
 relax_int       boolean flag to relax integrality constraints on integer variables
+
+returns a named tuple with the MIP termination_status, primal_status, objective_value,
+objective_bound, relative_gap and solve_time (captured before the dual re-solve), and
+duals_available, which is false when duals were not requested or could not be obtained
 
 """
 
@@ -55,29 +62,38 @@ function solve_model!(path::AbstractString,model::Model,relax_int::Bool;
     gap = try relative_gap(model) catch; NaN end
     verbose && @info "termination = $(s), gap = $(round(gap*100, digits=1))%"
 
-    # relax integrality to get dual information
+    # solution summary captured before any dual re-solve overwrites it
+    info = (termination_status = s,
+        primal_status = primal_status(model),
+        objective_value = objective_value(model),
+        objective_bound = try objective_bound(model) catch; NaN end,
+        relative_gap = gap,
+        solve_time = try solve_time(model) catch; NaN end,
+        duals_available = false)
+
+    # fix integer variables at rounded values and re-solve the LP to get dual information
     if duals && !relax_int
-        # save values of all variables
         vALL = all_variables(model)
-        v_L = value.(vALL)
-        # locate and fix integer variables
-        vINT = is_integer.(vALL)
-        unset_integer.(vALL[vINT])
-        fix.(vALL[vINT],v_L[vINT]; force=true)
-        # locate and fix binary variables
-        vBIN = is_binary.(vALL)
-        unset_binary.(vALL[vBIN])
-        fix.(vALL[vBIN],v_L[vBIN]; force=true)
-        # solve relaxed model
+        v_L = value.(vALL)      # saved MIP solution
+        undo = fix_discrete_variables(var -> round(value(var)), model)
         optimize!(model)
         if primal_status(model) != MOI.FEASIBLE_POINT
-            @warn "relaxed re-solve returned no solution; outputs unreliable" status=termination_status(model)
+            @warn "relaxed re-solve returned no solution; restoring the MIP solution, duals will be zero" status=termination_status(model)
+            undo()
+            set_start_value.(vALL, v_L)
+            optimize!(model)
+            if primal_status(model) != MOI.FEASIBLE_POINT
+                error("❗  MIP could not be re-optimized after failed dual re-solve.\n(status = $(termination_status(model)))")
+            end
         end
     end
 
+    info = merge(info, (duals_available = duals && has_duals(model),))
     if duals
-        println(progress_io, has_duals(model) ? "   ℹ  Dual information available." :
+        println(progress_io, info.duals_available ? "   ℹ  Dual information available." :
             "   ❗  Dual information unavailable.")
     end
+
+    return info
 
 end

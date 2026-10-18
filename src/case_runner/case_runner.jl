@@ -149,7 +149,7 @@ function run_decarb!(path::AbstractString;
     println(io, "\u23E9 solving model")
 
     mkpath(joinpath(path,"out"))        # create output directory if it does not exist
-    solve_model!(path,model,relax_integrality; duals, verbose)
+    solve_info = solve_model!(path,model,relax_integrality; duals, verbose)
 
     a16 = time()		# elapsed time
     println(io, "   \u231B elapsed time ... ", round(a16-a15; digits=2), " seconds\n")
@@ -170,7 +170,7 @@ function run_decarb!(path::AbstractString;
     df_fuel = read_fuel(model,tm,chp["N"],abp["N"],wh["N"])
     df_indoor = read_indoor(model,tm,chp["N"],abp["N"],hvac["N"],wh["N"],wh["tank_eff"],
         topo["chp_bdg"])
-    df_dual,df_econ = read_econ(model,tm; duals)
+    df_dual,df_econ = read_econ(model,tm; duals=solve_info.duals_available)
 
     a17 = time()		# elapsed time
     println(io, "   \u231B elapsed time ... ", round(a17-a16; digits=2), " seconds\n")
