@@ -385,7 +385,7 @@ This file has columns `name` and `eq`, with one row per metric.
 |---|---|---|
 | `total_cost` | $ | Complete objective: energy bill, non-service penalties, annualized new-equipment cost, and EV driver-preference term. Existing equipment capital cost is sunk. |
 | `energy_bill` | $ | Grid purchases minus grid-sale revenue, plus capacity, fuel, variable O&M, and fixed O&M costs. |
-| `grid_sales` | $ | Grid-export revenue, reported as a positive amount. |
+| `grid_sales` | $ | Grid-export revenue, reported as a negative amount. |
 | `grid_purchases` | $ | Grid-import energy cost. |
 | `capacity_charge` | $ | Peak-capacity charges. |
 | `fuel_purchases` | $ | Gaseous- and liquid-fuel cost. |
