@@ -55,10 +55,20 @@ using Pkg
 Pkg.instantiate()
 ```
 
-HiGHS is the default open-source solver. Other licensed solvers are welcome as optional extensions. 
-Contributors adding support for another solver should follow the same pattern used for Gurobi: 
-define an optional package extension, add the corresponding solver configuration, 
-and document the required installation, loading, and licensing steps.
+HiGHS is the default open-source solver. Other solvers, including licensed ones, are
+welcome. DECARB does not depend on them: users install and load the solver package
+themselves and pass its optimizer to `run_decarb!`. Solver-specific settings follow
+this pattern:
+
+1. Add `src/configure_solver/configure_<solver>.jl` with a function that sets the
+   solver's raw attributes (gap, time limit, and any tuning) on the model, and
+   include it in `src/DECARB.jl`.
+2. Add a branch in `configure_solver!` (`src/configure_solver/configure_solver.jl`)
+   that detects the solver from `solver_name(model)` and calls that function.
+   Unrecognized solvers fall back to the generic MOI gap and time-limit attributes.
+3. Do not add the solver package to `[deps]` or `[compat]` in `Project.toml`.
+4. Add a test using a recording MOI optimizer, as in the existing Gurobi test, and
+   document the required installation, loading, and licensing steps in the README.
 
 ## Branches
 

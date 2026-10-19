@@ -57,9 +57,9 @@ dictionaries. The case results are written to its `out/` directory.
 
 ### Other solvers
 
-DECARB currently includes a configuration for Gurobi and can be configured for
-any other compatible JuMP MIP solver through the `optimizer` keyword.
-Extensions for additional solvers will be included in future releases.
+DECARB currently includes a configuration for Gurobi, detected automatically from
+the optimizer, and can be configured for any other compatible JuMP MIP solver 
+through the `optimizer` keyword. Solver packages are not DECARB dependencies.
 Specific solvers must be installed and, where required, licensed separately.
 
 For a fresh installation, add the chosen solver's Julia package first, then
