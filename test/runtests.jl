@@ -784,9 +784,13 @@ end
 
 @testset "minimal :: runs and writes outputs" begin
     p = stage()
-    for f in ("eq1.csv", "eq2.csv", "ts.csv")
+    for f in ("eq1.csv", "eq2.csv", "ts.csv", "solve_info.csv")
         @test isfile(joinpath(p, "out", f))
     end
+    si   = readout(p, "solve_info.csv")
+    info = Dict(zip(string.(si.name), string.(si.value)))
+    @test info["termination_status"] == "OPTIMAL"
+    @test info["primal_status"] == "FEASIBLE_POINT"
     # balance.csv is written ONLY when the electricity balance fails to close
     @test !isfile(joinpath(p, "out", "balance.csv"))
     @test !isfile(joinpath(p, "out", "iis_constraints.txt"))

@@ -23,7 +23,8 @@ case/
 `-- out/
     |-- eq1.csv
     |-- eq2.csv
-    `-- ts.csv
+    |-- ts.csv
+    `-- solve_info.csv
 ```
 
 The current runner opens all 14 input files, even when a technology is not
@@ -458,6 +459,14 @@ are energy per period.
 
 Dual columns are zero when the selected solve does not provide dual values.
 Their sign follows the corresponding JuMP constraint convention.
+
+### `solve_info.csv`: solve summary
+
+This file has columns `name` and `value`: the MIP `termination_status`,
+`primal_status`, `objective_value`, `objective_bound`, `relative_gap` and
+`solve_time` (s), captured before the dual re-solve, and `duals_available`. A
+`termination_status` of `TIME_LIMIT` means the reported solution is the best one
+found within `time_limit`, not necessarily within `mip_gap`.
 
 ### Conditional diagnostic outputs
 

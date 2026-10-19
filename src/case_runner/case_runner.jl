@@ -179,10 +179,11 @@ function run_decarb!(path::AbstractString;
 
     write_outputs(path,tm["Date"],df_chp,df_hvac,df_abp,df_wh,df_pv,df_bess,
         df_wind,df_elec,balance,df_fuel,df_indoor,df_dual,df_econ; io)
+    write_solve_info(path,solve_info)
 
     a18 = time()		# elapsed time
     println(io, "   \u231B elapsed time ... ", round(a18-a17; digits=2), " seconds\n")
 
-    return (; model, cfg, tm, bdg, sp, chp, abp, hvac, wh, pv, wind, bess, ev, topo)
+    return (; model, cfg, tm, bdg, sp, chp, abp, hvac, wh, pv, wind, bess, ev, topo, solve_info)
 
 end

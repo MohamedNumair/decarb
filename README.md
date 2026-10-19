@@ -99,6 +99,7 @@ DECARB writes:
 - `out/eq1.csv`: cost and emissions summary
 - `out/eq2.csv`: installed equipment and investment summary
 - `out/ts.csv`: dispatch, temperature, fuel, state-of-charge, and dual time series
+- `out/solve_info.csv`: solver termination status, MIP gap, and solve time
 - `out/balance.csv`: written only when the electrical balance tolerance is exceeded
 - `out/iis_constraints.txt`: written when the solver can identify conflicting constraints
 
