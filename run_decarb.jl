@@ -9,6 +9,21 @@ The default solver is HiGHS. The case list defaults to `bdg_path.txt`.
 
 using DECARB
 
+# Solver packages must be imported at top level, before run_batch starts.
+# To add a solver: (1) accept its name in parse_args and usage, (2) add a branch in
+# optimizer_for, (3) add an `import` for its package in the block below.
+function requested_solver(args::Vector{String})
+    for (i, arg) in enumerate(args)
+        arg == "--solver" && i < length(args) && return lowercase(args[i + 1])
+        startswith(arg, "--solver=") && return lowercase(split(arg, "="; limit=2)[2])
+    end
+    return "highs"
+end
+
+if requested_solver(ARGS) == "gurobi" && Base.find_package("Gurobi") !== nothing
+    import Gurobi
+end
+
 function usage(io::IO=stdout)
     println(io, """
     Usage:
